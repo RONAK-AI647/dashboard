@@ -32,28 +32,36 @@ jobs:
           kubectl create namespace volcano-system || true
           kubectl apply -f deployment/volcano-dashboard.yaml
 
-      - name: Debug Pod Status
+      - name: Debug: Pod Status
         run: kubectl get pods -n volcano-system -o wide
 
-      - name: Debug Check Pod Logs
+      - name: Debug: Check Pod Logs
         run: |
           POD=$(kubectl get pod -l app=volcano-dashboard -n volcano-system -o jsonpath='{.items[0].metadata.name}')
           kubectl logs -n volcano-system $POD || true
 
-      - name: Debug Describe Dashboard Pod
-        run: kubectl describe pod -l app=volcano-dashboard -n volcano-system || true
-
-      - name: Debug Check All Events
-        run: kubectl get events -n volcano-system --sort-by='.lastTimestamp' || true
-
       - name: Wait for Dashboard to be Ready
         run: |
-          kubectl wait --for=condition=ready pod -l app=volcano-dashboard -n volcano-system --timeout=300s
+          kubectl wait --for=condition=ready pod -l app=volcano-dashboard -n volcano-system --timeout=180s
 
       - name: Port-forward Dashboard Frontend
         run: |
           nohup kubectl port-forward svc/volcano-dashboard 8080:80 -n volcano-system &
-          sleep 10
+          for i in {1..30}; do
+            nc -z localhost 8080 && echo "Port 8080 is open" && exit 0
+            echo "Waiting for port 8080 to open..."
+            sleep 5
+          done
+          echo "Port 8080 did not open in time" && exit 1
+
+      - name: Debug: Get Services
+        run: kubectl get svc -n volcano-system -o wide
+
+      - name: Debug: Get Pods
+        run: kubectl get pods -n volcano-system -o wide
+
+      - name: Debug: Check Port-Forward Process
+        run: ps aux | grep 'kubectl port-forward'
 
       - name: Install Puppeteer
         run: npm install puppeteer
@@ -62,34 +70,32 @@ jobs:
         run: |
           node <<EOF
           const puppeteer = require('puppeteer');
+          const maxRetries = 5;
+          const delay = ms => new Promise(res => setTimeout(res, ms));
 
           (async () => {
-            const maxRetries = 5;
-            const delay = (ms) => new Promise((res) => setTimeout(res, ms));
+            const browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox'] });
+            const page = await browser.newPage();
 
-            for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            for (let i = 1; i <= maxRetries; i++) {
               try {
-                console.log(\`Attempt \${attempt}: Connecting to Dashboard...\`);
-                const browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox'] });
-                const page = await browser.newPage();
-                await page.goto('http://localhost:8080', { waitUntil: 'domcontentloaded', timeout: 30000 });
-                
-                await page.waitForSelector('body', { timeout: 10000 }); // Change selector as needed!
+                console.log(\`Attempt \${i}: Connecting to Dashboard...\`);
+                await page.goto('http://localhost:8080', { waitUntil: 'networkidle2', timeout: 60000 });
+                console.log("Connected!");
                 await page.screenshot({ path: 'dashboard-screenshot.png' });
-                console.log("Screenshot taken successfully!");
-                await browser.close();
-                process.exit(0);
-              } catch (error) {
-                console.error(\`Error on attempt \${attempt}: \`, error.message);
-                if (attempt < maxRetries) {
-                  console.log("Retrying in 10 seconds...");
-                  await delay(10000);
-                } else {
+                break;
+              } catch (err) {
+                console.error(\`Error on attempt \${i}: \${err.message}\`);
+                if (i === maxRetries) {
                   console.error("Max retries reached. Failing...");
                   process.exit(1);
                 }
+                console.log("Retrying in 10 seconds...");
+                await delay(10000);
               }
             }
+
+            await browser.close();
           })();
           EOF
 
