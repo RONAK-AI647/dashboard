@@ -32,8 +32,9 @@ jobs:
           kubectl create namespace volcano-system || true
           kubectl apply -f deployment/volcano-dashboard.yaml
 
-      - name: Debug: Check Pod Status
-        run: kubectl get pods -n volcano-system -o wide
+      - name: Debug: Pod Status
+        run: |
+          kubectl get pods -n volcano-system -o wide
 
       - name: Debug: Check Pod Logs
         run: |
