@@ -32,6 +32,15 @@ jobs:
           kubectl create namespace volcano-system || true
           kubectl apply -f deployment/volcano-dashboard.yaml
 
+      - name: Debug: Check Pod Status
+        run: kubectl get pods -n volcano-system -o wide
+
+      - name: Debug: Check Pod Logs
+        run: |
+          POD=$(kubectl get pod -l app=volcano-dashboard -n volcano-system -o jsonpath='{.items[0].metadata.name}')
+          kubectl logs -n volcano-system $POD || true
+
+
       - name: Wait for Dashboard to be Ready
         run: |
           kubectl wait --for=condition=ready pod -l app=volcano-dashboard -n volcano-system --timeout=180s
