@@ -54,13 +54,13 @@ jobs:
           done
           echo "Port 8080 did not open in time" && exit 1
 
-      - name: Debug: Get Services
+      - name: Debug Get Services
         run: kubectl get svc -n volcano-system -o wide
 
-      - name: Debug: Get Pods
+      - name: Debug Get Pods
         run: kubectl get pods -n volcano-system -o wide
 
-      - name: Debug: Check Port-Forward Process
+      - name: Debug Check Port-Forward Process
         run: ps aux | grep 'kubectl port-forward'
 
       - name: Install Puppeteer
