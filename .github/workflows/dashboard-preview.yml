@@ -32,18 +32,18 @@ jobs:
           kubectl create namespace volcano-system || true
           kubectl apply -f deployment/volcano-dashboard.yaml
 
-      - name: Debug: Pod Status
+      - name: Debug Pod Status
         run: kubectl get pods -n volcano-system -o wide
 
-      - name: Debug: Check Pod Logs
+      - name: Debug Check Pod Logs
         run: |
           POD=$(kubectl get pod -l app=volcano-dashboard -n volcano-system -o jsonpath='{.items[0].metadata.name}')
           kubectl logs -n volcano-system $POD || true
 
-      - name: Debug: Describe Dashboard Pod
+      - name: Debug Describe Dashboard Pod
         run: kubectl describe pod -l app=volcano-dashboard -n volcano-system || true
 
-      - name: Debug: Check All Events
+      - name: Debug Check All Events
         run: kubectl get events -n volcano-system --sort-by='.lastTimestamp' || true
 
       - name: Wait for Dashboard to be Ready
