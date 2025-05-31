@@ -1,0 +1,198 @@
+name: Dashboard Preview
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  dashboard-preview:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Set up Kubernetes with Kind
+        uses: helm/kind-action@v1.5.0
+        with:
+          cluster_name: volcano
+
+      - name: Apply Volcano Dashboard YAML
+        run: |
+          echo "Applying Kubernetes manifests for Volcano Dashboard..."
+          kubectl create namespace volcano-system || true
+          kubectl apply -f deployment/volcano-dashboard.yaml
+          echo "Kubernetes manifests applied."
+
+      - name: Debug Kubernetes Resources (Initial State)
+        run: |
+          echo "--- Current Deployments in volcano-system ---"
+          kubectl get deployments -n volcano-system -o wide || true
+          echo "--- Current Services in volcano-system ---"
+          kubectl get services -n volcano-system -o wide || true
+          echo "--- Current Pods in volcano-system ---"
+          kubectl get pods -n volcano-system -o wide || true
+          echo "--- Current Endpoints for volcano-dashboard service ---"
+          kubectl get endpoints volcano-dashboard -n volcano-system || true
+        continue-on-error: true
+
+      - name: Wait for Dashboard Pods to be Ready
+        run: |
+          echo "Waiting for volcano-dashboard pods to be ready (up to 5 minutes)..."
+          kubectl wait --for=condition=ready pod -l app=volcano-dashboard -n volcano-system --timeout=300s
+          echo "Volcano Dashboard pods are reported as ready."
+
+      - name: Wait for Dashboard Service Endpoints to be Ready
+        run: |
+          echo "Waiting for volcano-dashboard service endpoints to be available (up to 60 seconds)..."
+          # CORRECTED: Wait for the service to have at least one subset of endpoints
+          kubectl wait --for=jsonpath='{.subsets}' service/volcano-dashboard -n volcano-system --timeout=60s
+          echo "Volcano Dashboard service endpoints are available."
+
+      - name: Get Dashboard Pod Name and Logs (for post-ready debugging)
+        id: get_pod_name
+        run: |
+          POD_NAME=$(kubectl get pod -l app=volcano-dashboard -n volcano-system -o jsonpath='{.items[0].metadata.name}')
+          echo "DASHBOARD_POD_NAME=$POD_NAME" >> $GITHUB_ENV
+          echo "--- Logs for frontend container in $POD_NAME (after pod ready) ---"
+          kubectl logs -n volcano-system "$POD_NAME" -c frontend || true
+          echo "--- Logs for backend container in $POD_NAME (after pod ready) ---"
+          kubectl logs -n volcano-system "$POD_NAME" -c backend || true
+        continue-on-error: true
+
+      - name: Port-forward Dashboard Frontend & Robust Application Health Check
+        run: |
+          echo "Starting kubectl port-forward for volcano-dashboard service (8080:80)..."
+          nohup kubectl port-forward svc/volcano-dashboard 8080:80 -n volcano-system > port-forward.log 2>&1 &
+          PORT_FORWARD_PID=$!
+          echo "$PORT_FORWARD_PID" > port-forward.pid
+          echo "kubectl port-forward command started with PID: $PORT_FORWARD_PID"
+
+          sleep 3 # Give it a moment to actually fork
+          if ! ps -p $PORT_FORWARD_PID > /dev/null; then
+            echo "Error: kubectl port-forward process (PID $PORT_FORWARD_PID) died immediately after starting."
+            echo "--- Content of port-forward.log ---"
+            cat port-forward.log
+            echo "--- End of port-forward.log ---"
+            exit 1
+          fi
+          echo "kubectl port-forward process is running."
+
+          echo "Waiting for localhost:8080 to be listening (up to 60 seconds)..."
+          LISTEN_TIMEOUT=60
+          for i in $(seq 1 $LISTEN_TIMEOUT); do
+            if ss -tuln | grep -q ":8080"; then
+              echo "Port 8080 is now listening on localhost."
+              break
+            fi
+            echo "Attempt $i/$LISTEN_TIMEOUT: Port 8080 not yet listening. Waiting 1 second..."
+            sleep 1
+          done
+
+          if ! ss -tuln | grep -q ":8080"; then
+            echo "Error: Port 8080 did not become active on localhost within ${LISTEN_TIMEOUT} seconds."
+            echo "--- Content of port-forward.log ---"
+            cat port-forward.log
+            echo "--- End of port-forward.log ---"
+            echo "--- Current network listeners ---"
+            ss -tuln
+            exit 1
+          fi
+
+          echo "Port-forward tunnel established. Now performing application-level health check with curl..."
+          APP_HEALTH_TIMEOUT=120
+          for i in $(seq 1 $APP_HEALTH_TIMEOUT); do
+            if curl -s -f -o /dev/null http://localhost:8080; then
+              echo "Dashboard at http://localhost:8080 is responding with HTTP 200 OK."
+              break
+            fi
+            echo "Attempt $i/$APP_HEALTH_TIMEOUT: Dashboard not yet responding with HTTP 200. Waiting 1 second..."
+            sleep 1
+          done
+
+          if ! curl -s -f -o /dev/null http://localhost:8080; then
+            echo "Error: Dashboard at http://localhost:8080 did not respond with HTTP 200 OK within ${APP_HEALTH_TIMEOUT} seconds."
+            echo "--- Detailed Curl Output (if available) ---"
+            curl -v http://localhost:8080 || true
+            echo "--- End of Detailed Curl Output ---"
+            echo "--- Content of port-forward.log ---"
+            cat port-forward.log
+            echo "--- End of port-forward.log ---"
+            exit 1
+          fi
+
+          echo "Dashboard is confirmed accessible and responsive via port-forward."
+
+      - name: Install Puppeteer
+        run: npm install puppeteer
+
+      - name: Take Screenshot of Dashboard
+        run: |
+          node <<EOF
+          const puppeteer = require('puppeteer');
+          const MAX_RETRIES = 5;
+          const RETRY_INTERVAL = 15000;
+
+          (async () => {
+            console.log('Launching Puppeteer browser...');
+            const browser = await puppeteer.launch({
+              headless: true,
+              args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--no-zygote',
+                '--single-process'
+              ]
+            });
+            const page = await browser.newPage();
+            await page.setViewport({ width: 1440, height: 900 });
+
+            let success = false;
+
+            for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+              try {
+                console.log(\`Attempt \${attempt} of \${MAX_RETRIES}: Navigating to http://localhost:8080...\`);
+                await page.goto('http://localhost:8080', {
+                  waitUntil: 'networkidle0',
+                  timeout: 90000
+                });
+                console.log('Dashboard page loaded successfully!');
+
+                await page.screenshot({ path: 'dashboard-screenshot.png', fullPage: true });
+                console.log('Screenshot taken!');
+                success = true;
+                break;
+              } catch (error) {
+                console.log(\`Error on attempt \${attempt}: \${error.message}\`);
+                if (attempt < MAX_RETRIES) {
+                  console.log(\`Retrying in \${RETRY_INTERVAL / 1000} seconds...\`);
+                  await new Promise(res => setTimeout(res, RETRY_INTERVAL));
+                }
+              }
+            }
+
+            await browser.close();
+
+            if (!success) {
+              console.error('Max retries reached. Failing to take screenshot.');
+              process.exit(1);
+            }
+          })();
+          EOF
+
+      - name: Upload Screenshot Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-preview
+          path: dashboard-screenshot.png
