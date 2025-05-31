@@ -32,23 +32,58 @@ jobs:
           kubectl create namespace volcano-system || true
           kubectl apply -f deployment/volcano-dashboard.yaml
 
-      - name: Debug Pod Status
+      - name: Debug Pod Status (for inspection)
         run: |
+          echo "Current Kubernetes cluster info:"
+          kubectl cluster-info
+          echo "Pods in volcano-system namespace:"
           kubectl get pods -n volcano-system -o wide
+        continue-on-error: true # Allow this step to fail without stopping the workflow
 
-      - name: Debug Check Pod Logs
+      - name: Wait for Dashboard Pod to be Ready
         run: |
-          POD=$(kubectl get pod -l app=volcano-dashboard -n volcano-system -o jsonpath='{.items[0].metadata.name}')
-          kubectl logs -n volcano-system $POD || true
+          echo "Waiting for volcano-dashboard pod to be ready..."
+          kubectl wait --for=condition=ready pod -l app=volcano-dashboard -n volcano-system --timeout=300s # Increased timeout just in case
 
-      - name: Wait for Dashboard to be Ready
+      - name: Get Dashboard Pod Name (for logging)
+        id: get_pod_name
         run: |
-          kubectl wait --for=condition=ready pod -l app=volcano-dashboard -n volcano-system --timeout=180s
+          POD_NAME=$(kubectl get pod -l app=volcano-dashboard -n volcano-system -o jsonpath='{.items[0].metadata.name}')
+          echo "DASHBOARD_POD_NAME=$POD_NAME" >> $GITHUB_ENV
 
-      - name: Port-forward Dashboard Frontend
+      - name: Debug Dashboard Pod Logs (after ready, before port-forward)
+        if: env.DASHBOARD_POD_NAME
         run: |
-          nohup kubectl port-forward svc/volcano-dashboard 8080:80 -n volcano-system &
-          sleep 10
+          echo "Fetching logs for pod: ${{ env.DASHBOARD_POD_NAME }}"
+          kubectl logs -n volcano-system ${{ env.DASHBOARD_POD_NAME }} || true
+        continue-on-error: true
+
+      - name: Port-forward Dashboard Frontend & Robust Wait for Port
+        run: |
+          echo "Starting port-forward..."
+          # Use a specific temporary file for the port-forward process ID
+          nohup kubectl port-forward svc/volcano-dashboard 8080:80 -n volcano-system > port-forward.log 2>&1 &
+          echo $! > port-forward.pid # Store PID for potential killing later if needed
+
+          # Wait for the port to be truly listening on localhost:8080
+          echo "Waiting for port 8080 to be active on localhost..."
+          for i in $(seq 1 60); do # Try for up to 60 * 1 = 60 seconds
+            if ss -tuln | grep -q ":8080"; then
+              echo "Port 8080 is now listening."
+              break
+            fi
+            echo "Port 8080 not listening yet, waiting 1 second... ($i/60)"
+            sleep 1
+          done
+
+          if ! ss -tuln | grep -q ":8080"; then
+            echo "Error: Port 8080 did not become active within the timeout."
+            cat port-forward.log # Show port-forward logs if it failed
+            exit 1
+          fi
+
+          echo "Initial sleep after port-forward is active..."
+          sleep 10 # Give the application a little more time after port is open
 
       - name: Install Puppeteer
         run: npm install puppeteer
@@ -57,20 +92,38 @@ jobs:
         run: |
           node <<EOF
           const puppeteer = require('puppeteer');
-          const MAX_RETRIES = 5;
+          const MAX_RETRIES = 10; // Increased retries
           const RETRY_INTERVAL = 10000; // 10 seconds
 
           (async () => {
-            const browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox'] });
+            console.log('Launching Puppeteer browser...');
+            const browser = await puppeteer.launch({
+              headless: true,
+              args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox', // Add this for better CI compatibility
+                '--disable-dev-shm-usage'   // Recommended for Puppeteer in Docker/CI
+              ]
+            });
             const page = await browser.newPage();
+            await page.setViewport({ width: 1280, height: 900 }); // Set a reasonable viewport
+
             let success = false;
 
             for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
               try {
-                console.log(\`Attempt \${attempt}: Connecting to Dashboard...\`);
-                await page.goto('http://localhost:8080', { waitUntil: 'networkidle2', timeout: 30000 });
-                console.log('Dashboard loaded successfully!');
-                await page.screenshot({ path: 'dashboard-screenshot.png' });
+                console.log(\`Attempt \${attempt} of \${MAX_RETRIES}: Navigating to http://localhost:8080...\`);
+                await page.goto('http://localhost:8080', {
+                  waitUntil: 'networkidle0', // Use networkidle0 for more robust waiting
+                  timeout: 60000 // Increased timeout for goto
+                });
+                console.log('Dashboard page loaded successfully!');
+
+                // Optional: Add a delay here if the dashboard takes time to render content after load
+                // await new Promise(res => setTimeout(res, 5000));
+
+                await page.screenshot({ path: 'dashboard-screenshot.png', fullPage: true }); // Take a full page screenshot
+                console.log('Screenshot taken!');
                 success = true;
                 break;
               } catch (error) {
@@ -85,7 +138,7 @@ jobs:
             await browser.close();
 
             if (!success) {
-              console.error('Max retries reached. Failing...');
+              console.error('Max retries reached. Failing to take screenshot.');
               process.exit(1);
             }
           })();
